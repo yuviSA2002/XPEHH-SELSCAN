@@ -1,0 +1,292 @@
+#!/bin/bash
+
+#
+#SBATCH --job-name=sel
+#SBATCH --output=%J.out
+#SBATCH --error=%J.err
+
+
+#SBATCH --partition=hpc_q_small
+
+##SBATCH --nodelist=node[36]
+##SBATCH --nodelist=node
+
+##SBATCH -N 2
+#SBATCH --exclusive
+##SBATCH -s
+##SBATCH --nodelist=gpunode2
+##SBATCH --time=2-00:00:00
+#SBATCH --mem=180G  # 100G on all node
+
+#SBATCH --cpus-per-task=72
+##SBATCH --ntasks-per-core=24  #disabled hyperthreading
+##SBATCH --ntasks-per-node=24  # number of processes per node
+time
+
+#!/bin/bash
+set -euo pipefail
+
+module load bcftools-1.21
+module load selscan2
+
+# -------------- INPUT -----------------
+REGION=${1:-}
+GENE=$2
+
+if [[ -z "$REGION" ]]; then
+  echo "[INFO] No region provided. Processing full chromosome."
+  FULL_CHROM=true
+  CHROM=$(echo "$GENE" | sed 's/[^0-9]*//g')
+  REGION="$CHROM"
+else
+  FULL_CHROM=false
+  CHROM=$(echo "$REGION" | cut -d ':' -f 1)
+fi
+
+# Define paths
+HOME_DIR="/gpfs/data/user/yuvraj"
+IND_VCF="${HOME_DIR}/${CHROM}_all_sorted_withID_MIE0.05Rem.vcf.gz.target.phased.vcf.gz"
+SUPER_POP_VCF_DIR="/gpfs/data/user/yuvraj/soft_1kGP_splitted"
+OUT_DIR="/gpfs/data/user/yuvraj/selection/${GENE}"
+SCRIPT_DIR="/gpfs/data/user/yuvraj/scripts"
+SUBPOP_SID_DIR="/gpfs/data/user/yuvraj/subpop_sid"
+
+IND_POP_DIR="${OUT_DIR}/ind_subsets"
+SUPER_POP_DIR="${OUT_DIR}/super_pop"
+INTERSECTION_DIR="${OUT_DIR}/intersection"
+
+mkdir -p ${IND_POP_DIR}/{af_done,ac_done}
+mkdir -p ${SUPER_POP_DIR}/{af_done,ac_done}
+mkdir -p ${INTERSECTION_DIR}
+mkdir -p logs
+
+# -------------- INDIAN POPULATION -----------------
+
+cd ${IND_POP_DIR}
+
+for pop in AA TB DR IE; do
+    if [ "$FULL_CHROM" = true ]; then
+        bcftools view -S ${SUBPOP_SID_DIR}/${pop}_samples.txt -Oz -o ${pop}_${GENE}_region.vcf.gz "$IND_VCF"
+    else
+        bcftools view -r "$REGION" -S ${SUBPOP_SID_DIR}/${pop}_samples.txt -Oz -o ${pop}_${GENE}_region.vcf.gz "$IND_VCF"
+    fi
+    bcftools index ${pop}_${GENE}_region.vcf.gz
+    # Count variants in initial VCF file
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ${pop}_${GENE}_region.vcf.gz -H | wc -l)
+    else
+        # Parse region to add/subtract 1Mb for counting
+        CHROM_PART=$(echo "$REGION" | cut -d':' -f1)
+        COORDS=$(echo "$REGION" | cut -d':' -f2)
+        START=$(echo "$COORDS" | cut -d'-' -f1)
+        END=$(echo "$COORDS" | cut -d'-' -f2)
+        START=$((START + 1000000))
+        END=$((END - 1000000))
+        ADJUSTED_REGION="${CHROM_PART}:${START}-${END}"
+        count=$(bcftools view -r "$ADJUSTED_REGION" ${pop}_${GENE}_region.vcf.gz -H | wc -l)
+    fi
+    echo "${pop}_${GENE}_region.vcf.gz : $count variants"
+done
+
+# Process full Indian population
+if [ "$FULL_CHROM" = true ]; then
+    bcftools view -Oz -o IND_${GENE}_region.vcf.gz "$IND_VCF"
+else
+    bcftools view -r "$REGION" -Oz -o IND_${GENE}_region.vcf.gz "$IND_VCF"
+fi
+bcftools index IND_${GENE}_region.vcf.gz
+# Count variants in full Indian population VCF
+if [ "$FULL_CHROM" = true ]; then
+    count=$(bcftools view IND_${GENE}_region.vcf.gz -H | wc -l)
+else
+    # Parse region to add/subtract 1Mb for counting
+    CHROM_PART=$(echo "$REGION" | cut -d':' -f1)
+    COORDS=$(echo "$REGION" | cut -d':' -f2)
+    START=$(echo "$COORDS" | cut -d'-' -f1)
+    END=$(echo "$COORDS" | cut -d'-' -f2)
+    START=$((START + 1000000))
+    END=$((END - 1000000))
+    ADJUSTED_REGION="${CHROM_PART}:${START}-${END}"
+    count=$(bcftools view -r "$ADJUSTED_REGION" IND_${GENE}_region.vcf.gz -H | wc -l)
+fi
+echo "IND_${GENE}_region.vcf.gz : $count variants"
+
+for pop in AA TB DR IE IND; do
+    bcftools +fill-tags ${pop}_${GENE}_region.vcf.gz -- -t AF | bcftools view -Oz -o ${pop}_${GENE}_region_af.vcf.gz
+    bcftools index ${pop}_${GENE}_region_af.vcf.gz
+    # Count variants after adding AF tags
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ${pop}_${GENE}_region_af.vcf.gz -H | wc -l)
+    else
+        count=$(bcftools view -r "$ADJUSTED_REGION" ${pop}_${GENE}_region_af.vcf.gz -H | wc -l)
+    fi
+    echo "${pop}_${GENE}_region_af.vcf.gz : $count variants"
+
+    bcftools view -i 'AC>=2' ${pop}_${GENE}_region_af.vcf.gz -Oz -o ac_${pop}_${GENE}_region_af.vcf.gz
+    bcftools index ac_${pop}_${GENE}_region_af.vcf.gz
+    # Count variants after AC filtering
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ac_${pop}_${GENE}_region_af.vcf.gz -H | wc -l)
+    else
+        count=$(bcftools view -r "$ADJUSTED_REGION" ac_${pop}_${GENE}_region_af.vcf.gz -H | wc -l)
+    fi
+    echo "ac_${pop}_${GENE}_region_af.vcf.gz : $count variants"
+
+    mv ac_${pop}_${GENE}_region_af.vcf.gz ${IND_POP_DIR}/ac_done
+    mv ac_${pop}_${GENE}_region_af.vcf.gz.tbi ${IND_POP_DIR}/ac_done 2>/dev/null || true
+    mv ac_${pop}_${GENE}_region_af.vcf.gz.csi ${IND_POP_DIR}/ac_done 2>/dev/null || true
+
+    mv ${pop}_${GENE}_region_af.vcf.gz ${IND_POP_DIR}/af_done
+    mv ${pop}_${GENE}_region_af.vcf.gz.tbi ${IND_POP_DIR}/af_done 2>/dev/null || true
+    mv ${pop}_${GENE}_region_af.vcf.gz.csi ${IND_POP_DIR}/af_done 2>/dev/null || true
+done
+
+# -------------- SUPER POPULATIONS -----------------
+
+cd ${SUPER_POP_DIR}
+
+for spop in AFR AMR SAS EAS EUR; do
+    if [ "$FULL_CHROM" = true ]; then
+        bcftools view -r "$CHROM" -Oz -o ${spop}_${CHROM}_${GENE}_region.vcf.gz ${SUPER_POP_VCF_DIR}/1kGP_high_coverage_Illumina.ALL.filtered.SNV_INDEL_SV_phased_panel_${spop}.vcf.gz
+    else
+        bcftools view -r "$REGION" -Oz -o ${spop}_${CHROM}_${GENE}_region.vcf.gz ${SUPER_POP_VCF_DIR}/1kGP_high_coverage_Illumina.ALL.filtered.SNV_INDEL_SV_phased_panel_${spop}.vcf.gz
+    fi
+    bcftools index ${spop}_${CHROM}_${GENE}_region.vcf.gz
+    # Count variants in initial super population VCF
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ${spop}_${CHROM}_${GENE}_region.vcf.gz -H | wc -l)
+    else
+        # Parse region to add/subtract 1Mb for counting
+        CHROM_PART=$(echo "$REGION" | cut -d':' -f1)
+        COORDS=$(echo "$REGION" | cut -d':' -f2)
+        START=$(echo "$COORDS" | cut -d'-' -f1)
+        END=$(echo "$COORDS" | cut -d'-' -f2)
+        START=$((START + 1000000))
+        END=$((END - 1000000))
+        ADJUSTED_REGION="${CHROM_PART}:${START}-${END}"
+        count=$(bcftools view -r "$ADJUSTED_REGION" ${spop}_${CHROM}_${GENE}_region.vcf.gz -H | wc -l)
+    fi
+    echo "${spop}_${CHROM}_${GENE}_region.vcf.gz : $count variants"
+
+    bcftools +fill-tags ${spop}_${CHROM}_${GENE}_region.vcf.gz -- -t AF | bcftools view -Oz -o ${spop}_${CHROM}_${GENE}_region_af.vcf.gz
+    bcftools index ${spop}_${CHROM}_${GENE}_region_af.vcf.gz
+    # Count variants after adding AF tags
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ${spop}_${CHROM}_${GENE}_region_af.vcf.gz -H | wc -l)
+    else
+        count=$(bcftools view -r "$ADJUSTED_REGION" ${spop}_${CHROM}_${GENE}_region_af.vcf.gz -H | wc -l)
+    fi
+    echo "${spop}_${CHROM}_${GENE}_region_af.vcf.gz : $count variants"
+
+    bcftools view -i 'AC>0' ${spop}_${CHROM}_${GENE}_region_af.vcf.gz -Oz -o ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz
+    bcftools index ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz
+    # Count variants after AC filtering
+    if [ "$FULL_CHROM" = true ]; then
+        count=$(bcftools view ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz -H | wc -l)
+    else
+        count=$(bcftools view -r "$ADJUSTED_REGION" ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz -H | wc -l)
+    fi
+    echo "ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz : $count variants"
+
+    mv ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz ${SUPER_POP_DIR}/ac_done
+    mv ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz.tbi ${SUPER_POP_DIR}/ac_done 2>/dev/null || true
+    mv ac_${spop}_${CHROM}_${GENE}_region_af.vcf.gz.csi ${SUPER_POP_DIR}/ac_done 2>/dev/null || true
+
+    mv ${spop}_${CHROM}_${GENE}_region_af.vcf.gz ${SUPER_POP_DIR}/af_done
+    mv ${spop}_${CHROM}_${GENE}_region_af.vcf.gz.tbi ${SUPER_POP_DIR}/af_done 2>/dev/null || true
+    mv ${spop}_${CHROM}_${GENE}_region_af.vcf.gz.csi ${SUPER_POP_DIR}/af_done 2>/dev/null || true
+done
+
+# -------------- INTERSECTION + SELSCAN -----------------
+
+cd "${OUT_DIR}"
+
+for group in AA DR TB IE IND; do
+    for pop in AFR AMR EAS SAS EUR; do
+        FILE1="${IND_POP_DIR}/ac_done/ac_${group}_${GENE}_region_af.vcf.gz"
+        FILE2="${SUPER_POP_DIR}/ac_done/ac_${pop}_${CHROM}_${GENE}_region_af.vcf.gz"
+        if [[ -f "$FILE1" && -f "$FILE2" ]]; then
+            bcftools isec -n=2 -Oz "$FILE1" "$FILE2" -p ${INTERSECTION_DIR}/isec_output_${group}_${pop}
+            # Count variants in intersection files
+            if [ "$FULL_CHROM" = true ]; then
+                count1=$(bcftools view ${INTERSECTION_DIR}/isec_output_${group}_${pop}/0000.vcf.gz -H | wc -l)
+                count2=$(bcftools view ${INTERSECTION_DIR}/isec_output_${group}_${pop}/0001.vcf.gz -H | wc -l)
+            else
+                count1=$(bcftools view -r "$ADJUSTED_REGION" ${INTERSECTION_DIR}/isec_output_${group}_${pop}/0000.vcf.gz -H | wc -l)
+                count2=$(bcftools view -r "$ADJUSTED_REGION" ${INTERSECTION_DIR}/isec_output_${group}_${pop}/0001.vcf.gz -H | wc -l)
+            fi
+            echo "${INTERSECTION_DIR}/isec_output_${group}_${pop}/0000.vcf.gz : $count1 variants"
+            echo "${INTERSECTION_DIR}/isec_output_${group}_${pop}/0001.vcf.gz : $count2 variants"
+        fi
+    done
+done
+
+cd ${INTERSECTION_DIR}
+
+for dir in isec_output_*; do
+    if [[ -f "${dir}/0000.vcf.gz" && -f "${dir}/0001.vcf.gz" && -f "${dir}/sites.txt" ]]; then
+        cd "${dir}"
+        selscan --threads 70 --xpehh --vcf "0000.vcf.gz" --vcf-ref "0001.vcf.gz" --map "sites.txt" --pmap --out "$(basename ${dir}).xpehh.out"
+        cd ..
+    fi
+done
+
+# -------------- ORGANIZE XP-EHH OUTPUT -----------------
+
+XPEHH_OUT_DIR="${OUT_DIR}/xpehh_output"
+mkdir -p "${XPEHH_OUT_DIR}"
+
+for group in AA DR TB IE IND; do
+    mkdir -p "${XPEHH_OUT_DIR}/${group}"
+done
+
+for dir in ${INTERSECTION_DIR}/isec_output_*; do
+    base=$(basename "${dir}")
+    group=$(echo "${base}" | cut -d'_' -f3)
+    spop=$(echo "${base}" | cut -d'_' -f4)
+
+    if [[ -f "${dir}/${base}.xpehh.out.xpehh.out" ]]; then
+        cp "${dir}/${base}.xpehh.out.xpehh.out" "${XPEHH_OUT_DIR}/${group}/${group}_${spop}.xpehh.out"
+    fi
+done
+
+echo "All XP-EHH output files moved to ${XPEHH_OUT_DIR}, organized by population group."
+
+#--------------PLOT THE XP-EHH OUTPUT for each group
+
+cd ${XPEHH_OUT_DIR}
+module load python3
+# Parse region to add/subtract 1Mb
+if [[ "$REGION" == *":"* ]]; then
+    # If region is in format chr:start-end
+    CHROM_PART=$(echo "$REGION" | cut -d':' -f1)
+    COORDS=$(echo "$REGION" | cut -d':' -f2)
+    START=$(echo "$COORDS" | cut -d'-' -f1)
+    END=$(echo "$COORDS" | cut -d'-' -f2)
+    START=$((START + 1000000))
+    END=$((END - 1000000))
+    PLOT_REGION="${CHROM_PART}:${START}-${END}"
+else
+    # If region is just chromosome, use just the chromosome number
+    CHROM_NUM=$(echo "$REGION" | sed 's/[^0-9]*//g')
+    PLOT_REGION="chr${CHROM_NUM}"
+fi
+
+for group in AA DR TB IE IND; do
+    xpehh_files=()
+    for spop in AFR AMR EAS SAS EUR; do
+        xpehh_files+=("${XPEHH_OUT_DIR}/${group}/${group}_${spop}.xpehh.out")
+    done
+    # Change directory to the group's subdirectory
+    cd "${XPEHH_OUT_DIR}/${group}"
+    # Run the plotting script with output file specified
+    python3 ${SCRIPT_DIR}/xplot.py ${PLOT_REGION} "${xpehh_files[@]}" --colors red blue green orange purple --out "${group}_plot"
+    # Return to the main directory
+    cd "${XPEHH_OUT_DIR}"
+done
+
+# --------------   PIPELINE COMPLETED -----------------
+
+echo "Pipeline completed for gene: $GENE with region: ${REGION:-whole chromosome}"
+
+
